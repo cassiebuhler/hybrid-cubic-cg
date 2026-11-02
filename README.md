@@ -1,8 +1,9 @@
-# Hybrid Cubic CG 
+# Hybrid Cubic CG
 
 A Python implementation of the **Hybrid Cubic Regularization of Conjugate Gradient Minimization Methods (CGM)** for smooth unconstrained optimization.
 
-Standard nonlinear CG restarts its search direction when conjugacy is lost (a Powell restart), which can slow convergence from superlinear to linear. Hybrid Cubic CG instead applies cubic regularization to the search direction, but only on those iterations. The regularized direction has a closed form derived from Shanno's memoryless BFGS view of CG, so the method stays matrix-free with the same per-iteration cost as standard CG.
+In our paper, ["Regularized Step Directions in Nonlinear Conjugate Gradient Methods"](https://link.springer.com/article/10.1007/s12532-024-00265-9), we proposed **CGM with hybrid cubic regularization** to improve the step quality of CGM. S
+tandard CGM restarts its search direction when conjugacy is lost (a Powell restart), which can slow convergence from superlinear to linear. Hybrid Cubic CG instead applies cubic regularization to the search direction, but only on those iterations. The regularized direction has a closed form derived from Shanno's memoryless BFGS view of CG, so the method stays matrix-free with the same per-iteration cost as standard CG.
 
 In the paper's experiments on the CUTEst test set, it needed fewer iterations, ran faster, and reset the search direction less often than standard CG.
 
@@ -48,9 +49,8 @@ If you use this package, please cite:
   year    = {2024},
   doi     = {10.1007/s12532-024-00265-9}
 }
-
 ```
 
 ## License
 
-BSD-3
+BSD-3-Clause.
