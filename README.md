@@ -31,7 +31,16 @@ res = minimize(f, x0=np.zeros(100), jac=grad)
 print(res.x, res.fun, res.nit)
 ```
 
-The interface follows `scipy.optimize.minimize`.
+The interface follows `scipy.optimize.minimize`, so you can also call it through SciPy as a custom method:
+
+```python
+from scipy.optimize import minimize as scipy_minimize
+from hybrid_cubic_cg import minimize
+
+res = scipy_minimize(f, x0=np.zeros(100), jac=grad, method=minimize)
+```
+
+Solver options such as `maxiter`, `gtol` and `pertlim` go in `options`, e.g. `options={"gtol": 1e-8}`.
 
 ## Citation
 

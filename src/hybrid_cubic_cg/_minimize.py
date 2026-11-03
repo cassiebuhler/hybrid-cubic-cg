@@ -10,18 +10,22 @@ import time
 import numpy as np
 from scipy import optimize
 
-def minimize(fun, x0, jac, *, maxiter=10000, gtol=1e-6, pertlim=5, disp=False):
+
+def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
+             disp=False, **unused):
     """
     Minimize a smooth function with hybrid cubic regularized conjugate gradient.
 
     Parameters
     ----------
     fun : callable
-        Objective function, ``fun(x) -> float``.
+        Objective function, ``fun(x, *args) -> float``.
     x0 : array_like, shape (n,)
         Initial guess.
+    args : tuple, optional
+        Extra arguments passed to ``fun`` and ``jac``.
     jac : callable
-        Gradient of ``fun``, ``jac(x) -> ndarray`` of shape (n,).
+        Gradient of ``fun``, ``jac(x, *args) -> ndarray`` of shape (n,).
     maxiter : int, optional
         Maximum number of iterations.
     gtol : float, optional
@@ -41,225 +45,216 @@ def minimize(fun, x0, jac, *, maxiter=10000, gtol=1e-6, pertlim=5, disp=False):
 
         Status codes: 0 = solved, 1 = search direction is not a descent
         direction, 2 = iterations limit reached, 3 = search direction is
-        undefined.
+        undefined, 4 = line search failed.
     """
-    #initialize
-    t_start = time.time()
+    # initialize
+    t_start = time.perf_counter()
+
+    # Wrap fun and jac so they receive the extra args
+    if not callable(jac):
+        raise ValueError('jac must be a callable that returns the gradient.')
+    _fun, _jac = fun, jac
+
+    def fun(x):
+        return _fun(x, *args)
+
+    def jac(x):
+        return _jac(x, *args)
+
+    # Counters and outputs
+    k = 0
     nfev = 0
     njev = 0
-
-    #data preprocessing
-    # CG solver
-    x = np.asarray(x0, dtype=float).copy()
-    n = x.size
-    alpha = 1.0
-    c = jac(x)
-    njev += 1
-    pertcnt = 0
-    nrst = n
-    restart = False
-
-    inPowell = False
-    dprat = 0.0
-    ddprat = 0.0
-    lam = 0
-    k = 0
-
-    #set to None because we will define later
-    c0 = None
-    dprat0 = None
-    prat = None
-    prat0 = None
-    olamb = None
-    oolamb = None
-    alpha0 = None
-    restart0 = None
-    xprev = None
-    dx0 = None
-    c00 = None
-
     status = None
     objs = []
     gradNorms = []
-    history = {}
-    history['objective'] = []
-    history['gradNorm'] = []
+    invokedCubic = False
 
-    while (k < maxiter):
+    # Current point and gradient (c is the gradient, following Conmin's notation)
+    x = np.asarray(x0, dtype=float).copy()
+    n = x.size
+    c = jac(x)
+    njev += 1
+    f = fun(x)
+    nfev += 1
+    alpha = 1.0
+    dg_prev = None  # slope g'd from the previous line search, for the initial step guess
+
+    # Restart and regularization control
+    stage = 0      # 0: first step (H0 = I), 1: second step (H1, eq. 13), 2: regular iterations
+    nrst = n       # steps since the last restart; nrst == n forces a restart
+    pertcnt = 0    # lambda values tried in this episode (u in Algorithm 2)
+    lam = 0.0      # cubic regularization parameter; 0 when not regularizing
+
+    # Saved at x_k before each line search, so a rejected trial point can be rolled back
+    xprev = None
+    c0 = None      # gradient at x_k
+    c00 = None     # gradient at x_{k-1}
+    alpha0 = None
+    dx0 = None
+    stage0 = None
+
+    # Main loop: Algorithm 2 (Hybrid Cubic Regularization of CGM)
+    while k < maxiter:
         k += 1
-        xTx = np.dot(x,x)
-        cTc = np.dot(c,c)
+        cTc = np.dot(c, c)
 
         # Check for convergence
         if (np.sqrt(cTc) <= gtol):
-            status = 0 #solved
+            status = 0  # solved
             break
 
         # Compute step direction
-        if restart == False:
+        if stage == 0:
             dx = -c
         else:
-            # test to see if powell restart criterion holds
-            if (nrst != n) and (restart >1) and (abs(np.dot(c,c0)/cTc) > 0.2):
-                if nrst == 0:
-                    nrst = n
-                inPowell = True
-                if lam == 0.0:
-                    if dprat0 != 0.0:
-                        ddprat = ( abs(np.dot(c,c0)/cTc) - 2*prat + prat0 ) / ( (lam - olamb)*(oolamb-olamb) )
-                    dprat0 = dprat
-                    if lam >0:
-                        dprat = ( abs(np.dot(c,c0)/cTc) - prat ) / ( lam - olamb )
-                    if prat is not None:
-                        prat0 = prat
-
-                    prat = abs(np.dot(c,c0)/cTc)
-                    alpha = alpha0
-                    restart = restart0
-                    x = xprev
-                    dx = dx0
-                    c = c0
-                    c0 = c00
-                    xTx = np.dot(x,x)
-                    cTc = np.dot(c,c)
-
-                    if olamb is not None:
-                        oolamb = olamb
-                    olamb = lam
-                    if lam == 0.0:
-                        lam = prat/0.2
-                    else:
-                        if pertcnt <= 0.2:
-                            lam = olamb - prat/dprat
-                        else:
-                            if ( dprat*dprat - 2*ddprat*prat > 0) and (abs(ddprat) > 1e-8 ):
-                                lam = olamb + max( (-dprat + np.sqrt(dprat*dprat - 2*ddprat*prat))/ddprat, (-dprat - np.sqrt(dprat*dprat - 2*ddprat*prat))/ddprat )
-                            else:
-                                lam = 2*olamb
-
-                        if lam < 1e-12:
-                            lam = 2*olamb
-
+            # Powell test (eq. 7): if conjugacy is lost, roll back and try a regularized step
+            if (nrst != n) and (stage > 1) and (abs(np.dot(c, c0)/cTc) > 0.2) and (pertcnt < pertlim):
+                invokedCubic = True
+                objs.pop()
+                gradNorms.pop()
+                prat = abs(np.dot(c, c0)/cTc)
+                alpha = alpha0
+                stage = stage0
+                x = xprev
+                f = f0
+                dx = dx0
+                c = c0
+                c0 = c00
+                cTc = np.dot(c, c)
+                if lam == 0:
+                    lam = prat/0.2
                 else:
                     lam = 2*lam
                 pertcnt += 1
                 k -= 1
 
             else:
+                if pertcnt >= pertlim and abs(np.dot(c, c0)/cTc) > 0.2:
+                    nrst = n    # U values of lambda tried: accept this point and restart here
                 dx0 = dx
-                if ( pertcnt > 0 ):
-                    lam = lam/2.0
-                else:
-                    lam = 0.0
-                dprat = 0.0
-                dprat0 = 0.0
-                prat0 = 0.0
+                lam = 0
                 pertcnt = 0
             # If performing a restart, update the Beale restart vectors
-            if ( nrst == n ):
+            if nrst == n:
                 pt = alpha*dx
                 yt = c - c0
-                ytTyt = np.dot(yt,yt)
-                cTyt = np.dot(pt,yt)
-                cTct = np.dot(pt,pt)
+                ytTyt = np.dot(yt, yt)
+                ptTyt = np.dot(pt, yt)
+                ptTpt = np.dot(pt, pt)
 
             p = alpha*dx
             y = c - c0
-            pTc = np.dot(pt,c)
-            yTc = np.dot(yt,c)
+            pTc = np.dot(pt, c)
+            yTc = np.dot(yt, c)
 
             u1 = -pTc/ytTyt
-            u2 = 2*pTc/cTyt - yTc/ytTyt
-            u3 = cTyt/ytTyt
+            u2 = 2*pTc/ptTyt - yTc/ytTyt
+            scale = ptTyt/ytTyt
 
-            if ( pertcnt == 0 ) :
-                dx = -u3*c - u1*yt - u2*pt
+            if pertcnt == 0:
+                dx = -scale*c - u1*yt - u2*pt
             else:
-                bracket = lam*lam + 2*lam*ytTyt/cTyt + ytTyt/cTct
-                a = -cTyt/(lam*cTyt + ytTyt)
-                b1 = (-lam*cTyt - 2*ytTyt)*ytTyt/(cTyt*cTct*bracket*(lam*cTyt + ytTyt))
-                d = lam/(bracket*(lam*cTyt + ytTyt))
-                e = ytTyt/(cTct*bracket*(lam*cTyt + ytTyt))
+                bracket = lam*lam + 2*lam*ytTyt/ptTyt + ytTyt/ptTpt
+                a = -ptTyt/(lam*ptTyt + ytTyt)
+                b1 = (-lam*ptTyt - 2*ytTyt)*ytTyt/(ptTyt*ptTpt*bracket*(lam*ptTyt + ytTyt))
+                dcoef = lam/(bracket*(lam*ptTyt + ytTyt))
+                e = ytTyt/(ptTpt*bracket*(lam*ptTyt + ytTyt))
+                dx = a*c + b1*pTc*pt + dcoef*yTc*yt + e*yTc*pt + e*pTc*yt
 
-                bracket = lam*lam+lam/u3+lam*ytTyt/cTyt+cTyt/(u3*cTct)
-                denom = u3*u3*cTct*lam*bracket + u3*cTct*bracket
-                d = u3*u3*lam*(cTct/cTyt) / denom
+            if nrst != n:
+                if pertcnt == 0:
+                    u1 = -np.dot(y, pt)/ytTyt
+                    u2 = -np.dot(y, yt)/ytTyt + 2*np.dot(y, pt)/ptTyt
+                    pTy = np.dot(p, y)
+                    Hty = ptTyt/ytTyt*y + u1*yt + u2*pt
+                    yHty = np.dot(Hty, y)
 
-                dx = a*c + b1*pTc*pt + d*yTc*yt + e*yTc*pt + e*pTc*yt
-
-            if ( nrst != n ):
-                if ( pertcnt == 0 ):
-                    u1 = -np.dot(y,pt)/ytTyt
-                    u2 = -np.dot(y,yt)/ytTyt + 2*np.dot(y,pt)/cTyt
-                    u3 = np.dot(p,y)
-                    temp = cTyt/ytTyt*y + u1*yt + u2*pt
-                    u4 = np.dot(temp, y)
-
-                    u1 = -np.dot(p,c)/u3
-                    u2 = (u4/u3 + 1)*np.dot(p,c)/u3 - np.dot(c,temp)/u3
-                    dx = dx - u1*temp - u2*p
+                    u1 = -np.dot(p, c)/pTy
+                    u2 = (yHty/pTy + 1)*np.dot(p, c)/pTy - np.dot(c, Hty)/pTy
+                    dx = dx - u1*Hty - u2*p
                 else:
-                    ptTy = np.dot(pt,y)
-                    ytTy = np.dot(yt,y)
-                    temp1 = -(a*y + b1*ptTy*pt + d*ytTy*yt + e*ytTy*pt + e*ptTy*yt)
+                    ptTy = np.dot(pt, y)
+                    ytTy = np.dot(yt, y)
+                    Hlam_y = -(a*y + b1*ptTy*pt + dcoef*ytTy*yt + e*ytTy*pt + e*ptTy*yt)
 
-                    a2 = 1.0/(lam*u3+1.0)
+                    a2 = 1.0/(lam*scale+1.0)
                     b2 = lam*b1
-                    d2 = lam*d
+                    d2 = lam*dcoef
                     e2 = lam*e
-                    ptTp = np.dot(pt,p)
-                    ytTp = np.dot(yt,p)
-                    temp2 = a2*p + b2*ptTp*pt + d2*ytTp*yt + e2*ytTp*pt + e2*ptTp*yt
+                    ptTp = np.dot(pt, p)
+                    ytTp = np.dot(yt, p)
+                    ptilde = a2*p + b2*ptTp*pt + d2*ytTp*yt + e2*ytTp*pt + e2*ptTp*yt
 
-                    u10 = np.dot(temp1, c)
-                    u11 = np.dot(temp2, c)
-                    u12 = np.dot(temp1, y)
-                    u13 = np.dot(temp2, y)
-                    u14 = np.dot(temp2, p)
+                    u10 = np.dot(Hlam_y, c)
+                    u11 = np.dot(ptilde, c)
+                    u12 = np.dot(Hlam_y, y)
+                    u13 = np.dot(ptilde, y)
+                    u14 = np.dot(ptilde, p)
                     u15 = np.dot(p, y)
                     denom = lam*u14*(u15 + u12) + u13*u13
-                    if denom < np.finfo(float).eps:
+                    if (not np.isfinite(denom)) or denom <= np.finfo(float).eps*(abs(lam*u14*(u15 + u12)) + u13*u13):
                         status = 3
                         break
-                    dx = dx + lam*u14*u10*temp1/denom - (u15 + u12)*u11*temp2/denom + u13*u10*temp2/denom + u13*u11*temp1/denom
+                    dx = dx + lam*u14*u10*Hlam_y/denom - (u15 + u12)*u11*ptilde/denom + u13*u10*ptilde/denom + u13*u11*Hlam_y/denom
 
         # Check that the search direction is a descent direction
         dxTc = np.dot(dx, c)
-        if ( dxTc > 0 ):
+        if dxTc > 0:
             status = 1
             break
         # Save the current point
         xprev = x
+        f0 = f
         if c0 is not None:
             c00 = c0
         c0 = c
         alpha0 = alpha
-        restart0 = restart
+        stage0 = stage
 
-        if ( restart == 0 ):
-            restart = 1
+        if stage == 0:
+            stage = 1
         else:
-            if ( pertcnt == 0 ):
-                if ( nrst == n ) :
+            if pertcnt == 0:
+                if nrst == n:
                     nrst = 0
-                nrst +=  1
-                restart = 2
+                nrst += 1
+                stage = 2
 
-        def afind(a):
-            nonlocal nfev
-            nfev += 1
-            return fun(x + a*dx)
-        alpha = optimize.fminbound(afind, 0, 10)
+        # Initial step length guess (as in Conmin-CG)
+        if stage <= 1:
+            alpha = 1.0/np.sqrt(cTc)
+        elif nrst == 1:
+            alpha = 1.0
+        else:
+            alpha = alpha*dg_prev/dxTc
+        dg_prev = dxTc
+
+        # Line search (Shanno's inexact line search from Conmin-CG)
+        alpha, f_new, c_new, ok, ntry = line_search(fun, jac, xprev, f0, dx, dxTc, alpha, gtol)
+        nfev += ntry
+        njev += ntry
+
+        if not ok:
+            if stage <= 1:
+                status = 4  # failed even along steepest descent
+                break
+            # restart with steepest descent from the current point
+            nrst = n
+            stage = 0
+            lam = 0.0
+            pertcnt = 0
+            continue
 
         # Take the step and update function value and gradient
         x = xprev + alpha*dx
-        c = jac(x)
-        njev += 1
-        objs.append(fun(x))
-        nfev += 1
+        f = f_new
+        c = c_new
+        objs.append(f)
         gradNorms.append(np.linalg.norm(c))
 
-    elapsedTime = time.time() - t_start
+    elapsedTime = time.perf_counter() - t_start
+    fval = f
 
     if status is None:
         status = 2
@@ -269,31 +264,100 @@ def minimize(fun, x0, jac, *, maxiter=10000, gtol=1e-6, pertlim=5, disp=False):
         1: 'Search direction is not a descent direction.',
         2: 'Iterations limit reached.',
         3: 'Search direction is undefined.',
+        4: 'Line search failed.',
     }
 
     if disp:
         print(messages[status])
-        print('time elapsed: ' + str(elapsedTime))
-        print('n = %d, Iters = %d, invokedCubic = %s\n'% (n, k, inPowell == 1))
+        print('         Current function value: %f' % fval)
+        print('         Iterations: %d' % len(objs))
+        print('         Function evaluations: %d' % nfev)
+        print('         Gradient evaluations: %d' % njev)
+        print('         Cubic regularization used: %s' % invokedCubic)
 
-    history['objective'] = objs
-    history['gradNorm'] = gradNorms
-    history['status'] = status
-    history['time'] = elapsedTime
-    history['iters'] = k
-    history['invokedCubic'] = inPowell == 1
+    history = {
+        'objective': objs,
+        'gradNorm': gradNorms,
+        'status': status,
+        'time': elapsedTime,
+        'iters': len(objs),
+        'invokedCubic': invokedCubic,
+    }
 
     return optimize.OptimizeResult(
         x=x,
-        fun=fun(x),
+        fun=fval,
         jac=c,
-        nit=k,
-        nfev=nfev + 1,
+        nit=len(objs),
+        nfev=nfev,
         njev=njev,
         status=status,
         success=(status == 0),
         message=messages[status],
-        invoked_cubic=bool(inPowell),
+        invoked_cubic=bool(invokedCubic),
         time=elapsedTime,
         history=history,
     )
+
+
+def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
+    """
+    Shanno's inexact line search, as implemented in Conmin-CG.
+
+    Finds alpha with sufficient decrease, f(x0 + alpha*dx) <= f0 + 1e-4*alpha*dg,
+    and a flatter slope, |jac(x0 + alpha*dx)'dx| < 0.9*|dg|, using Davidon's
+    cubic interpolation. dg = jac(x0)'dx must be negative.
+
+    Returns
+    -------
+    alpha : the step length
+    f : the function value at the new point
+    c : the gradient at the new point
+    ok : whether the search succeeded
+    ntry : the number of trial points (each costs one fun and one jac evaluation)
+    """
+    fmin = f0
+    ap, fp, dp = 0.0, f0, dg  # previous trial point: step, f, slope
+    dxTdx = np.dot(dx, dx)
+    ntry = 0
+    while ntry < maxtry:
+        if alpha*dxTdx < 1e-20:
+            return alpha, f0, None, False, ntry  # step has shrunk to nothing
+
+        x = x0 + alpha*dx
+        f = fun(x)
+        c = jac(x)
+        ntry += 1
+        dalpha = np.dot(c, dx)  # slope at alpha
+
+        # f went up but the slope is still negative: went too far, retry from alpha/3
+        if f > (1.0 + 1e-12)*fmin and dalpha < -1e-12:
+            alpha = alpha/3.0
+            ap, fp, dp = 0.0, fmin, dg
+            continue
+
+        # Accept: sufficient decrease and slope reduced (after at least two trials,
+        # unless the slope is already essentially zero)
+        if f <= fmin + 1e-4*alpha*dg and abs(dalpha/dg) < 0.9:
+            if ntry >= 2 or abs(dalpha/dg) < gtol:
+                return alpha, f, c, True, ntry
+
+        # Davidon's formula for the minimum of the cubic through (ap, fp, dp) and (alpha, f, dalpha)
+        u1 = dp + dalpha - 3.0*(fp - f)/(ap - alpha)
+        u2 = np.sqrt(max(u1*u1 - dp*dalpha, 0.0))
+        at = alpha - (alpha - ap)*(dalpha + u2 - u1)/(dalpha - dp + 2.0*u2)
+
+        if dalpha/dp > 0:
+            # minimum not bracketed yet: extrapolate (double) or step back (halve)
+            if dalpha <= 0 or at <= 0 or at >= 0.99*min(alpha, ap):
+                if dalpha > 0 or at <= 1.01*max(ap, alpha):
+                    at = 2*max(ap, alpha) if dalpha <= 0 else min(ap, alpha)/2
+        else:
+            # minimum bracketed: bisect if the cubic's guess is too close to an end
+            if at < 1.01*min(alpha, ap) or at > 0.99*max(alpha, ap):
+                at = (alpha + ap)/2
+
+        ap, fp, dp = alpha, f, dalpha
+        alpha = at
+
+    return alpha, f, c, True, ntry  # out of trials: take the last point
