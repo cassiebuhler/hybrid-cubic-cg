@@ -5,102 +5,23 @@ Implements the Hybrid Cubic Regularization of CGM from
 Buhler, Benson & Shanno (2024), "Regularized step directions in nonlinear
 conjugate gradient methods", Mathematical Programming Computation 16(4).
 """
-import inspect
 import time
-import warnings
 
 import numpy as np
 from scipy import optimize
 
-_FD_METHODS = ('2-point', '3-point')
-
-
-class _MemoizeFunJac:
-    """Split ``fun(x) -> (f, g)`` into separate cached ``fun`` and ``jac``."""
-
-    def __init__(self, fun):
-        self.fun = fun
-        self.x = None
-        self.f = None
-        self.g = None
-
-    def _compute(self, x, *args):
-        if self.x is None or not np.array_equal(x, self.x):
-            self.x = np.copy(x)
-            f, g = self.fun(x, *args)
-            self.f = f
-            self.g = np.asarray(g, dtype=float)
-
-    def value(self, x, *args):
-        self._compute(x, *args)
-        return self.f
-
-    def derivative(self, x, *args):
-        self._compute(x, *args)
-        return self.g
-
-
-def _fd_gradient(f, x, method):
-    """Finite-difference gradient of ``f`` at ``x``."""
-    g = np.empty_like(x)
-    if method == '2-point':
-        f0 = f(x)
-        for i in range(x.size):
-            h = np.sqrt(np.finfo(float).eps) * max(1.0, abs(x[i]))
-            xh = x.copy()
-            xh[i] += h
-            g[i] = (f(xh) - f0) / h
-    else:
-        for i in range(x.size):
-            h = np.finfo(float).eps ** (1 / 3) * max(1.0, abs(x[i]))
-            xp = x.copy()
-            xm = x.copy()
-            xp[i] += h
-            xm[i] -= h
-            g[i] = (f(xp) - f(xm)) / (2 * h)
-    return g
-
-
-def _wants_intermediate_result(callback):
-    try:
-        params = inspect.signature(callback).parameters
-    except (TypeError, ValueError):
-        return False
-    return set(params) == {'intermediate_result'}
-
-
-def minimize(fun, x0, *, args=(), jac=None, callback=None,
-             maxiter=10000, gtol=1e-6, pertlim=5, disp=False,
-             hess=None, hessp=None, bounds=None, constraints=None,
-             **unknown_options):
+def minimize(fun, x0, jac, *, maxiter=10000, gtol=1e-6, pertlim=5, disp=False):
     """
     Minimize a smooth function with hybrid cubic regularized conjugate gradient.
-
-    Can be called directly, or passed to SciPy as a custom method:
-    ``scipy.optimize.minimize(fun, x0, jac=grad, method=minimize)``.
-    Defaults for ``maxiter``, ``gtol`` and ``pertlim`` follow Section 4 of
-    Buhler, Benson & Shanno (2024).
 
     Parameters
     ----------
     fun : callable
-        Objective function, ``fun(x, *args) -> float``.
+        Objective function, ``fun(x) -> float``.
     x0 : array_like, shape (n,)
         Initial guess.
-    args : tuple, optional
-        Extra arguments passed to ``fun`` and ``jac``.
-    jac : {callable, True, None, '2-point', '3-point'}, optional
-        Gradient of ``fun``. A callable ``jac(x, *args) -> ndarray`` of
-        shape (n,). If True, ``fun`` returns ``(f, g)``. If None or a
-        finite-difference scheme, the gradient is approximated numerically
-        (None uses '2-point'). Note that ``scipy.optimize.minimize`` passes
-        finite-difference strings to custom methods as None, so '3-point'
-        only takes effect when this function is called directly.
-    callback : callable, optional
-        Called after each iteration as ``callback(intermediate_result)``
-        with an ``OptimizeResult`` holding ``x`` and ``fun`` (if its only
-        parameter is named ``intermediate_result``), otherwise as
-        ``callback(xk)``. Raise ``StopIteration`` to stop early.
+    jac : callable
+        Gradient of ``fun``, ``jac(x) -> ndarray`` of shape (n,).
     maxiter : int, optional
         Maximum number of iterations.
     gtol : float, optional
@@ -110,9 +31,6 @@ def minimize(fun, x0, *, args=(), jac=None, callback=None,
         (U in Algorithm 2). When reached, a restart is done instead.
     disp : bool, optional
         Print a summary when finished.
-    hess, hessp, bounds, constraints
-        Accepted for compatibility with ``scipy.optimize.minimize``.
-        Not used; a warning is issued if any is given.
 
     Returns
     -------
@@ -123,71 +41,20 @@ def minimize(fun, x0, *, args=(), jac=None, callback=None,
 
         Status codes: 0 = solved, 1 = search direction is not a descent
         direction, 2 = iterations limit reached, 3 = search direction is
-        undefined, 99 = ``callback`` raised ``StopIteration``.
+        undefined.
     """
-    if unknown_options:
-        warnings.warn('Unknown solver options: ' + ', '.join(unknown_options),
-                      optimize.OptimizeWarning, stacklevel=2)
-    if hess is not None or hessp is not None:
-        warnings.warn('hybrid_cubic_cg does not use Hessian information '
-                      '(hess/hessp).', RuntimeWarning, stacklevel=2)
-    if bounds is not None or constraints:
-        warnings.warn('hybrid_cubic_cg cannot handle bounds or constraints; '
-                      'they are ignored.', RuntimeWarning, stacklevel=2)
-
-    if not isinstance(args, tuple):
-        args = (args,)
-
-    if jac is True:
-        memo = _MemoizeFunJac(fun)
-        raw_fun, raw_jac = memo.value, memo.derivative
-    elif callable(jac):
-        raw_fun, raw_jac = fun, jac
-    elif jac is None or jac is False or jac in _FD_METHODS:
-        scheme = '2-point' if jac in (None, False) else jac
-        raw_fun = fun
-        raw_jac = lambda x, *a: _fd_gradient(fun_counted, x, scheme)
-    else:
-        raise ValueError(f"jac must be callable, True, None, '2-point' or "
-                         f"'3-point'; got {jac!r}.")
-
     #initialize
     t_start = time.time()
     nfev = 0
     njev = 0
 
-    def fun_counted(z):
-        nonlocal nfev
-        nfev += 1
-        return float(raw_fun(z, *args))
-
-    def jac_counted(z):
-        nonlocal njev
-        njev += 1
-        return np.asarray(raw_jac(z, *args), dtype=float)
-
-    new_style_callback = callback is not None and _wants_intermediate_result(callback)
-
-    def notify(xk, fk):
-        """Run the user callback on an accepted iterate. True means stop."""
-        if callback is None:
-            return False
-        try:
-            if new_style_callback:
-                callback(intermediate_result=optimize.OptimizeResult(
-                    x=np.copy(xk), fun=fk))
-            else:
-                callback(np.copy(xk))
-        except StopIteration:
-            return True
-        return False
-
     #data preprocessing
     # CG solver
-    x = np.asarray(x0, dtype=float).flatten()
+    x = np.asarray(x0, dtype=float).copy()
     n = x.size
     alpha = 1.0
-    c = jac_counted(x)
+    c = jac(x)
+    njev += 1
     pertcnt = 0
     nrst = n
     restart = False
@@ -222,13 +89,10 @@ def minimize(fun, x0, *, args=(), jac=None, callback=None,
         k += 1
         xTx = np.dot(x,x)
         cTc = np.dot(c,c)
-        retry = False
 
         # Check for convergence
         if (np.sqrt(cTc) <= gtol):
             status = 0 #solved
-            if objs and notify(x, objs[-1]):
-                status = 99
             break
 
         # Compute step direction
@@ -240,7 +104,6 @@ def minimize(fun, x0, *, args=(), jac=None, callback=None,
                 if nrst == 0:
                     nrst = n
                 inPowell = True
-                retry = True
                 if lam == 0.0:
                     if dprat0 != 0.0:
                         ddprat = ( abs(np.dot(c,c0)/cTc) - 2*prat + prat0 ) / ( (lam - olamb)*(oolamb-olamb) )
@@ -360,11 +223,6 @@ def minimize(fun, x0, *, args=(), jac=None, callback=None,
                         break
                     dx = dx + lam*u14*u10*temp1/denom - (u15 + u12)*u11*temp2/denom + u13*u10*temp2/denom + u13*u11*temp1/denom
 
-        # The previous step is accepted unless the Powell test sent us back
-        if not retry and objs and notify(x, objs[-1]):
-            status = 99
-            break
-
         # Check that the search direction is a descent direction
         dxTc = np.dot(dx, c)
         if ( dxTc > 0 ):
@@ -388,13 +246,17 @@ def minimize(fun, x0, *, args=(), jac=None, callback=None,
                 restart = 2
 
         def afind(a):
-            return fun_counted(x + a*dx)
+            nonlocal nfev
+            nfev += 1
+            return fun(x + a*dx)
         alpha = optimize.fminbound(afind, 0, 10)
 
         # Take the step and update function value and gradient
         x = xprev + alpha*dx
-        c = jac_counted(x)
-        objs.append(fun_counted(x))
+        c = jac(x)
+        njev += 1
+        objs.append(fun(x))
+        nfev += 1
         gradNorms.append(np.linalg.norm(c))
 
     elapsedTime = time.time() - t_start
@@ -407,7 +269,6 @@ def minimize(fun, x0, *, args=(), jac=None, callback=None,
         1: 'Search direction is not a descent direction.',
         2: 'Iterations limit reached.',
         3: 'Search direction is undefined.',
-        99: '`callback` raised `StopIteration`.',
     }
 
     if disp:
@@ -424,10 +285,10 @@ def minimize(fun, x0, *, args=(), jac=None, callback=None,
 
     return optimize.OptimizeResult(
         x=x,
-        fun=fun_counted(x),
+        fun=fun(x),
         jac=c,
         nit=k,
-        nfev=nfev,
+        nfev=nfev + 1,
         njev=njev,
         status=status,
         success=(status == 0),
