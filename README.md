@@ -31,7 +31,16 @@ res = minimize(f, x0=np.zeros(100), jac=grad)
 print(res.x, res.fun, res.nit)
 ```
 
-The interface follows `scipy.optimize.minimize`.
+It can also be used as a custom method in `scipy.optimize.minimize`:
+
+```python
+from scipy.optimize import minimize as scipy_minimize
+
+res = scipy_minimize(f, np.zeros(100), jac=grad, method=minimize,
+                     options={"gtol": 1e-6, "maxiter": 10000})
+```
+
+Supported arguments follow `scipy.optimize.minimize`: `args`, `jac` (callable, `True`, or `None` for finite differences), `callback`, and the options `maxiter`, `gtol`, `pertlim` and `disp`. Defaults follow Section 4 of the paper.
 
 ## Citation
 
