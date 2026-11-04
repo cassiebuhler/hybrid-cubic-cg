@@ -9,7 +9,12 @@ description = "Nonlinear conjugate gradient method with hybrid cubic regularizat
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
-authors = [{ name = "Cassidy K. Buhler" }]
+authors = [
+    { name = "Cassidy K. Buhler" },
+    { name = "Hande Y. Benson" },
+    { name = "David F. Shanno" },
+]
+maintainers = [{ name = "Cassidy K. Buhler" }]
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.23",

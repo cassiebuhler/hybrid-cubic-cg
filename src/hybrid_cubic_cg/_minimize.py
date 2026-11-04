@@ -5,14 +5,16 @@ Implements the Hybrid Cubic Regularization of CGM from
 Buhler, Benson & Shanno (2024), "Regularized step directions in nonlinear
 conjugate gradient methods", Mathematical Programming Computation 16(4).
 """
+import inspect
 import time
+import warnings
 
 import numpy as np
 from scipy import optimize
 
 
 def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
-             disp=False, **unused):
+             disp=False, callback=None, bounds=None, constraints=(), **unused):
     """
     Minimize a smooth function with hybrid cubic regularized conjugate gradient.
 
@@ -35,6 +37,13 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
         (U in Algorithm 2). When reached, a restart is done instead.
     disp : bool, optional
         Print a summary when finished.
+    callback : callable, optional
+        Called after each iteration as ``callback(xk)``, or as
+        ``callback(intermediate_result=res)`` with ``res.x`` and ``res.fun``.
+        Raise ``StopIteration`` inside it to stop early.
+    bounds, constraints
+        Not supported; accepted only so the solver can be passed to
+        ``scipy.optimize.minimize``.
 
     Returns
     -------
@@ -45,21 +54,44 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
 
         Status codes: 0 = solved, 1 = search direction is not a descent
         direction, 2 = iterations limit reached, 3 = search direction is
-        undefined, 4 = line search failed.
+        undefined, 4 = line search failed, 5 = function or gradient is not
+        finite, 6 = stopped by callback.
     """
     # initialize
     t_start = time.perf_counter()
 
-    # Wrap fun and jac so they receive the extra args
+    # Check options (scipy.optimize.minimize also passes hess=None and hessp=None)
+    if bounds is not None or constraints:
+        raise ValueError('bounds and constraints are not supported.')
+    unused = [key for key, val in unused.items() if val is not None or key not in ('hess', 'hessp')]
+    if unused:
+        warnings.warn('Unknown solver options: %s' % ', '.join(unused), optimize.OptimizeWarning, stacklevel=2)
+    newCallback = callback is not None and set(inspect.signature(callback).parameters) == {'intermediate_result'}
+
+    def report(x, f):
+        """Call the callback at an accepted point. Returns True if it raised StopIteration."""
+        if callback is None:
+            return False
+        try:
+            if newCallback:
+                callback(intermediate_result=optimize.OptimizeResult(x=np.copy(x), fun=f))
+            else:
+                callback(np.copy(x))
+        except StopIteration:
+            return True
+        return False
+
+    # Wrap fun and jac so they receive the extra args. The gradient is copied in case
+    # jac reuses its output array, since we keep gradients from previous iterations
     if not callable(jac):
         raise ValueError('jac must be a callable that returns the gradient.')
     _fun, _jac = fun, jac
 
     def fun(x):
-        return _fun(x, *args)
+        return np.asarray(_fun(x, *args), dtype=float).item()
 
     def jac(x):
-        return _jac(x, *args)
+        return np.array(_jac(x, *args), dtype=float)
 
     # Counters and outputs
     k = 0
@@ -69,11 +101,14 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
     objs = []
     gradNorms = []
     invokedCubic = False
+    newPoint = False  # x is a new point that hasn't been passed to the callback yet
 
-    # Current point and gradient (c is the gradient, following Conmin's notation)
-    x = np.asarray(x0, dtype=float).copy()
+    # Current point and gradient (g is the gradient)
+    x = np.atleast_1d(np.asarray(x0, dtype=float)).copy()
+    if x.ndim != 1:
+        raise ValueError('x0 must be one-dimensional.')
     n = x.size
-    c = jac(x)
+    g = jac(x)
     njev += 1
     f = fun(x)
     nfev += 1
@@ -88,8 +123,8 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
 
     # Saved at x_k before each line search, so a rejected trial point can be rolled back
     xprev = None
-    c0 = None      # gradient at x_k
-    c00 = None     # gradient at x_{k-1}
+    g0 = None      # gradient at x_k
+    g00 = None     # gradient at x_{k-1}
     alpha0 = None
     dx0 = None
     stage0 = None
@@ -97,31 +132,37 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
     # Main loop: Algorithm 2 (Hybrid Cubic Regularization of CGM)
     while k < maxiter:
         k += 1
-        cTc = np.dot(c, c)
+        gTg = np.dot(g, g)
+
+        # Check that the function and gradient are finite
+        if not (np.isfinite(f) and np.isfinite(gTg)):
+            status = 5
+            break
 
         # Check for convergence
-        if (np.sqrt(cTc) <= gtol):
+        if (np.sqrt(gTg) <= gtol):
             status = 0  # solved
             break
 
         # Compute step direction
         if stage == 0:
-            dx = -c
+            dx = -g
         else:
             # Powell test (eq. 7): if conjugacy is lost, roll back and try a regularized step
-            if (nrst != n) and (stage > 1) and (abs(np.dot(c, c0)/cTc) > 0.2) and (pertcnt < pertlim):
+            if (nrst != n) and (stage > 1) and (abs(np.dot(g, g0)/gTg) > 0.2) and (pertcnt < pertlim):
                 invokedCubic = True
+                newPoint = False
                 objs.pop()
                 gradNorms.pop()
-                prat = abs(np.dot(c, c0)/cTc)
+                prat = abs(np.dot(g, g0)/gTg)
                 alpha = alpha0
                 stage = stage0
                 x = xprev
                 f = f0
                 dx = dx0
-                c = c0
-                c0 = c00
-                cTc = np.dot(c, c)
+                g = g0
+                g0 = g00
+                gTg = np.dot(g, g)
                 if lam == 0:
                     lam = prat/0.2
                 else:
@@ -130,7 +171,12 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
                 k -= 1
 
             else:
-                if pertcnt >= pertlim and abs(np.dot(c, c0)/cTc) > 0.2:
+                # The point is accepted: call the callback, which can raise StopIteration to stop
+                newPoint = False
+                if report(x, f):
+                    status = 6
+                    break
+                if pertcnt >= pertlim and abs(np.dot(g, g0)/gTg) > 0.2:
                     nrst = n    # U values of lambda tried: accept this point and restart here
                 dx0 = dx
                 lam = 0
@@ -138,29 +184,29 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
             # If performing a restart, update the Beale restart vectors
             if nrst == n:
                 pt = alpha*dx
-                yt = c - c0
+                yt = g - g0
                 ytTyt = np.dot(yt, yt)
                 ptTyt = np.dot(pt, yt)
                 ptTpt = np.dot(pt, pt)
 
             p = alpha*dx
-            y = c - c0
-            pTc = np.dot(pt, c)
-            yTc = np.dot(yt, c)
+            y = g - g0
+            pTg = np.dot(pt, g)
+            yTg = np.dot(yt, g)
 
-            u1 = -pTc/ytTyt
-            u2 = 2*pTc/ptTyt - yTc/ytTyt
+            u1 = -pTg/ytTyt
+            u2 = 2*pTg/ptTyt - yTg/ytTyt
             scale = ptTyt/ytTyt
 
             if pertcnt == 0:
-                dx = -scale*c - u1*yt - u2*pt
+                dx = -scale*g - u1*yt - u2*pt
             else:
                 bracket = lam*lam + 2*lam*ytTyt/ptTyt + ytTyt/ptTpt
                 a = -ptTyt/(lam*ptTyt + ytTyt)
                 b1 = (-lam*ptTyt - 2*ytTyt)*ytTyt/(ptTyt*ptTpt*bracket*(lam*ptTyt + ytTyt))
                 dcoef = lam/(bracket*(lam*ptTyt + ytTyt))
                 e = ytTyt/(ptTpt*bracket*(lam*ptTyt + ytTyt))
-                dx = a*c + b1*pTc*pt + dcoef*yTc*yt + e*yTc*pt + e*pTc*yt
+                dx = a*g + b1*pTg*pt + dcoef*yTg*yt + e*yTg*pt + e*pTg*yt
 
             if nrst != n:
                 if pertcnt == 0:
@@ -170,8 +216,8 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
                     Hty = ptTyt/ytTyt*y + u1*yt + u2*pt
                     yHty = np.dot(Hty, y)
 
-                    u1 = -np.dot(p, c)/pTy
-                    u2 = (yHty/pTy + 1)*np.dot(p, c)/pTy - np.dot(c, Hty)/pTy
+                    u1 = -np.dot(p, g)/pTy
+                    u2 = (yHty/pTy + 1)*np.dot(p, g)/pTy - np.dot(g, Hty)/pTy
                     dx = dx - u1*Hty - u2*p
                 else:
                     ptTy = np.dot(pt, y)
@@ -186,8 +232,8 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
                     ytTp = np.dot(yt, p)
                     ptilde = a2*p + b2*ptTp*pt + d2*ytTp*yt + e2*ytTp*pt + e2*ptTp*yt
 
-                    u10 = np.dot(Hlam_y, c)
-                    u11 = np.dot(ptilde, c)
+                    u10 = np.dot(Hlam_y, g)
+                    u11 = np.dot(ptilde, g)
                     u12 = np.dot(Hlam_y, y)
                     u13 = np.dot(ptilde, y)
                     u14 = np.dot(ptilde, p)
@@ -199,16 +245,16 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
                     dx = dx + lam*u14*u10*Hlam_y/denom - (u15 + u12)*u11*ptilde/denom + u13*u10*ptilde/denom + u13*u11*Hlam_y/denom
 
         # Check that the search direction is a descent direction
-        dxTc = np.dot(dx, c)
-        if dxTc > 0:
+        dxTg = np.dot(dx, g)
+        if not dxTg < 0:  # also catches dxTg = 0 or NaN
             status = 1
             break
         # Save the current point
         xprev = x
         f0 = f
-        if c0 is not None:
-            c00 = c0
-        c0 = c
+        if g0 is not None:
+            g00 = g0
+        g0 = g
         alpha0 = alpha
         stage0 = stage
 
@@ -223,15 +269,15 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
 
         # Initial step length guess (as in Conmin-CG)
         if stage <= 1:
-            alpha = 1.0/np.sqrt(cTc)
+            alpha = 1.0/np.sqrt(gTg)
         elif nrst == 1:
             alpha = 1.0
         else:
-            alpha = alpha*dg_prev/dxTc
-        dg_prev = dxTc
+            alpha = alpha*dg_prev/dxTg
+        dg_prev = dxTg
 
         # Line search (Shanno's inexact line search from Conmin-CG)
-        alpha, f_new, c_new, ok, ntry = line_search(fun, jac, xprev, f0, dx, dxTc, alpha, gtol)
+        alpha, f_new, g_new, ok, ntry = line_search(fun, jac, xprev, f0, dx, dxTg, alpha, gtol)
         nfev += ntry
         njev += ntry
 
@@ -249,9 +295,14 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
         # Take the step and update function value and gradient
         x = xprev + alpha*dx
         f = f_new
-        c = c_new
+        g = g_new
         objs.append(f)
-        gradNorms.append(np.linalg.norm(c))
+        gradNorms.append(np.linalg.norm(g))
+        newPoint = True
+
+    # The final point passed no Powell test, so report it here
+    if newPoint:
+        report(x, f)
 
     elapsedTime = time.perf_counter() - t_start
     fval = f
@@ -265,6 +316,8 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
         2: 'Iterations limit reached.',
         3: 'Search direction is undefined.',
         4: 'Line search failed.',
+        5: 'Function or gradient is not finite.',
+        6: 'Stopped by callback.',
     }
 
     if disp:
@@ -287,7 +340,7 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
     return optimize.OptimizeResult(
         x=x,
         fun=fval,
-        jac=c,
+        jac=g,
         nit=len(objs),
         nfev=nfev,
         njev=njev,
@@ -312,7 +365,7 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
     -------
     alpha : the step length
     f : the function value at the new point
-    c : the gradient at the new point
+    g : the gradient at the new point
     ok : whether the search succeeded
     ntry : the number of trial points (each costs one fun and one jac evaluation)
     """
@@ -326,12 +379,13 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
 
         x = x0 + alpha*dx
         f = fun(x)
-        c = jac(x)
+        g = jac(x)
         ntry += 1
-        dalpha = np.dot(c, dx)  # slope at alpha
+        dalpha = np.dot(g, dx)  # slope at alpha
 
-        # f went up but the slope is still negative: went too far, retry from alpha/3
-        if f > (1.0 + 1e-12)*fmin and dalpha < -1e-12:
+        # f is not finite (e.g. outside the function's domain), or f went up but the
+        # slope is still negative: went too far, retry from alpha/3
+        if not (np.isfinite(f) and np.isfinite(dalpha)) or (f > (1.0 + 1e-12)*fmin and dalpha < -1e-12):
             alpha = alpha/3.0
             ap, fp, dp = 0.0, fmin, dg
             continue
@@ -340,7 +394,7 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
         # unless the slope is already essentially zero)
         if f <= fmin + 1e-4*alpha*dg and abs(dalpha/dg) < 0.9:
             if ntry >= 2 or abs(dalpha/dg) < gtol:
-                return alpha, f, c, True, ntry
+                return alpha, f, g, True, ntry
 
         # Davidon's formula for the minimum of the cubic through (ap, fp, dp) and (alpha, f, dalpha)
         u1 = dp + dalpha - 3.0*(fp - f)/(ap - alpha)
@@ -360,4 +414,4 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
         ap, fp, dp = alpha, f, dalpha
         alpha = at
 
-    return alpha, f, c, True, ntry  # out of trials: take the last point
+    return alpha, f0, None, False, ntry  # out of trials: the last point may not decrease f

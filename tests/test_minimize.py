@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from scipy.optimize import rosen, rosen_der
+from scipy.optimize import OptimizeWarning, rosen, rosen_der
 
 from hybrid_cubic_cg import minimize
 
@@ -114,7 +114,6 @@ def test_already_optimal():
     assert res.nit == 0
 
 
-
 def test_args_passed_to_fun_and_jac():
     def f(x, a):
         return np.sum((x - a)**2)
@@ -136,3 +135,89 @@ def test_scipy_custom_method():
     from scipy.optimize import minimize as scipy_minimize
     res = scipy_minimize(rosen, np.zeros(5), jac=rosen_der, method=minimize)
     assert res.fun == pytest.approx(rosen(res.x))
+
+
+def test_unknown_option_warns():
+    with pytest.warns(OptimizeWarning, match="gtoll"):
+        minimize(rosen, np.zeros(5), jac=rosen_der, gtoll=1e-8)
+
+
+def test_scipy_custom_method_no_warning():
+    import warnings
+    from scipy.optimize import minimize as scipy_minimize
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        scipy_minimize(rosen, np.zeros(5), jac=rosen_der, method=minimize)
+
+
+def test_bounds_not_supported():
+    with pytest.raises(ValueError):
+        minimize(rosen, np.zeros(5), jac=rosen_der, bounds=[(0, 1)]*5)
+
+
+def test_callback():
+    xs = []
+    res = minimize(rosen, np.zeros(5), jac=rosen_der, callback=xs.append)
+    assert len(xs) == res.nit
+    np.testing.assert_array_equal(xs[-1], res.x)
+
+
+def test_callback_intermediate_result_and_stop():
+    def callback(intermediate_result):
+        if intermediate_result.fun < 1:
+            raise StopIteration
+    res = minimize(rosen, np.zeros(5), jac=rosen_der, callback=callback)
+    assert res.status == 6
+    assert res.fun < 1
+
+
+def test_scipy_custom_method_callback():
+    from scipy.optimize import minimize as scipy_minimize
+    xs = []
+    res = scipy_minimize(rosen, np.zeros(5), jac=rosen_der, method=minimize, callback=xs.append)
+    assert len(xs) == res.nit
+
+
+@pytest.mark.parametrize("f, g", [
+    (lambda x: np.nan, lambda x: np.ones(3)),
+    (lambda x: 1.0, lambda x: np.full(3, np.nan)),
+])
+def test_not_finite(f, g):
+    res = minimize(f, np.zeros(3), jac=g)
+    assert res.status == 5
+    assert res.nfev == 1
+
+
+def test_line_search_backs_off_from_inf():
+    # f is inf outside x > 0, minimizer at x = 1
+    def f(x):
+        return -np.sum(np.log(x)) + np.sum(x) if np.all(x > 0) else np.inf
+    res = minimize(f, np.full(3, 0.1), jac=lambda x: 1 - 1/x)
+    assert res.status == 0
+    np.testing.assert_allclose(res.x, np.ones(3), atol=1e-6)
+
+
+def test_unbounded_does_not_succeed():
+    res = minimize(lambda x: np.sum(x), np.zeros(3), jac=lambda x: np.ones(3))
+    assert not res.success
+
+
+def test_jac_reusing_output_array():
+    buf = np.zeros(10)
+
+    def jac(x):
+        buf[:] = rosen_der(x)
+        return buf
+    res = minimize(rosen, np.zeros(10), jac=jac)
+    assert res.status == 0
+    np.testing.assert_allclose(res.x, np.ones(10), atol=1e-5)
+
+
+def test_fun_returning_array_gives_float():
+    res = minimize(lambda x: np.array([np.sum(x**2)]), np.ones(3), jac=lambda x: 2*x)
+    assert isinstance(res.fun, float)
+
+
+def test_x0_must_be_1d():
+    with pytest.raises(ValueError):
+        minimize(lambda x: np.sum(x**2), np.zeros((2, 2)), jac=lambda x: 2*x)
