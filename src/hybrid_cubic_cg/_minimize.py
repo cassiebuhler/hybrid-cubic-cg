@@ -5,16 +5,38 @@ Implements the Hybrid Cubic Regularization of CGM from
 Buhler, Benson & Shanno (2024), "Regularized step directions in nonlinear
 conjugate gradient methods", Mathematical Programming Computation 16(4).
 """
+from __future__ import annotations
+
 import inspect
 import time
 import warnings
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy import optimize
 
+EPS = np.finfo(float).eps
 
-def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, pertlim=5,
-             disp=False, callback=None, bounds=None, constraints=(), **unused):
+
+def minimize(
+    fun: Callable[..., Any],
+    x0: ArrayLike,
+    args: tuple = (),
+    jac: Callable[..., ArrayLike] | bool | str | None = None,
+    *,
+    maxiter: int = 10000,
+    gtol: float | None = None,
+    tol: float | None = None,
+    pertlim: int = 5,
+    finite_diff_rel_step: float | None = None,
+    disp: bool = False,
+    callback: Callable[..., Any] | None = None,
+    bounds: Any = None,
+    constraints: Any = (),
+    **unused: Any,
+) -> optimize.OptimizeResult:
     """
     Minimize a smooth function with hybrid cubic regularized conjugate gradient.
 
@@ -27,10 +49,14 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
         Initial guess.
     args : tuple, optional
         Extra arguments passed to ``fun`` and ``jac``.
-    jac : callable or True
+    jac : callable, True, None, '2-point' or '3-point', optional
         Gradient of ``fun``, ``jac(x, *args) -> ndarray`` of shape (n,).
         If ``True``, ``fun`` returns the gradient along with the value, and
-        it is called once per point.
+        it is called once per point. If ``None`` (the default) or
+        ``'2-point'``, the gradient is estimated by forward differences, which
+        costs ``n`` extra evaluations of ``fun`` per gradient; ``'3-point'``
+        uses central differences (``2n`` evaluations, more accurate). An
+        analytic gradient is much faster and more accurate for large ``n``.
     maxiter : int, optional
         Maximum number of iterations.
     gtol : float, optional
@@ -41,6 +67,10 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
     pertlim : int, optional
         Maximum number of lambda values tried for cubic regularization
         (U in Algorithm 2). When reached, a restart is done instead.
+    finite_diff_rel_step : float, optional
+        Relative step size for finite differences; the step for ``x[i]`` is
+        ``finite_diff_rel_step * max(1, |x[i]|)``. Defaults to ``sqrt(eps)``
+        for ``'2-point'`` and ``eps**(1/3)`` for ``'3-point'``.
     disp : bool, optional
         Print a summary when finished.
     callback : callable, optional
@@ -56,7 +86,9 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
     res : scipy.optimize.OptimizeResult
         Fields: ``x``, ``fun``, ``jac``, ``nit``, ``nfev``, ``njev``,
         ``status``, ``success``, ``message``, ``invoked_cubic``, ``time``,
-        and ``history``.
+        and ``history``. ``nfev`` counts every evaluation of ``fun``,
+        including those used for finite differences. ``history`` holds
+        per-iteration lists ``objective`` and ``grad_norm``.
 
         Status codes: 0 = solved, 1 = search direction is not a descent
         direction, 2 = iterations limit reached, 3 = search direction is
@@ -93,16 +125,19 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
     if gtol is None:
         gtol = tol if tol is not None else 1e-6
 
-    # Wrap fun and jac so they receive the extra args. The gradient is copied in case
-    # jac reuses its output array, since we keep gradients from previous iterations
+    # Wrap fun and jac so they receive the extra args and count evaluations. The gradient
+    # is copied in case jac reuses its output array, since we keep previous gradients
+    counts = {'f': 0, 'g': 0}
+    last = {'x': None}  # the most recent evaluation, so the same point is never evaluated twice
     if jac is True:
         # fun returns (f, g): evaluate it once per point and keep both results
         _fun_and_jac = fun
-        last = {'x': None}
 
         def evaluate(x):
             if last['x'] is None or not np.array_equal(last['x'], x):
                 f_val, g_val = _fun_and_jac(x, *args)
+                counts['f'] += 1
+                counts['g'] += 1
                 last['f'] = np.asarray(f_val, dtype=float).item()
                 last['g'] = np.array(g_val, dtype=float)
                 last['x'] = np.copy(x)
@@ -113,22 +148,54 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
 
         def jac(x):
             return np.copy(evaluate(x)['g'])
-    elif callable(jac):
-        _fun, _jac = fun, jac
+    else:
+        _fun = fun
 
-        def fun(x):
+        def call_fun(x):
+            counts['f'] += 1
             return np.asarray(_fun(x, *args), dtype=float).item()
 
-        def jac(x):
-            return np.array(_jac(x, *args), dtype=float)
-    else:
-        raise ValueError('jac must be a callable that returns the gradient, or True '
-                         'if fun returns (value, gradient).')
+        def fun(x):
+            if last['x'] is None or not np.array_equal(last['x'], x):
+                last['f'] = call_fun(x)
+                last['x'] = np.copy(x)
+            return last['f']
+
+        if callable(jac):
+            _jac = jac
+
+            def jac(x):
+                counts['g'] += 1
+                return np.array(_jac(x, *args), dtype=float)
+        elif jac is None or jac is False or jac in ('2-point', '3-point'):
+            # Finite differences: n extra evaluations of fun per gradient (2n for '3-point')
+            central = jac == '3-point'
+            if finite_diff_rel_step is None:
+                finite_diff_rel_step = EPS**(1/3) if central else EPS**0.5
+
+            def jac(x):
+                counts['g'] += 1
+                h = finite_diff_rel_step*np.where(x >= 0, 1.0, -1.0)*np.maximum(1.0, np.abs(x))
+                h = (x + h) - x  # make the step exactly representable
+                f_x = None if central else fun(x)
+                g = np.empty_like(x)
+                for i in range(x.size):
+                    xt = np.copy(x)
+                    xt[i] = x[i] + h[i]
+                    f_plus = call_fun(xt)
+                    if central:
+                        xt[i] = x[i] - h[i]
+                        g[i] = (f_plus - call_fun(xt))/(2*h[i])
+                    else:
+                        g[i] = (f_plus - f_x)/h[i]
+                return g
+        else:
+            raise ValueError("jac must be a callable that returns the gradient, True if fun "
+                             "returns (value, gradient), or None, '2-point' or '3-point' to "
+                             "use finite differences.")
 
     # Counters and outputs
     k = 0
-    nfev = 0
-    njev = 0
     status = None
     objs = []
     gradNorms = []
@@ -143,9 +210,7 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
         raise ValueError('x0 must be one-dimensional.')
     n = x.size
     g = jac(x)
-    njev += 1
     f = fun(x)
-    nfev += 1
     alpha = 1.0
     dg_prev = None  # slope g'd from the previous line search, for the initial step guess
 
@@ -157,6 +222,7 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
 
     # Saved at x_k before each line search, so a rejected trial point can be rolled back
     xprev = None
+    f0 = None      # f at x_k
     g0 = None      # gradient at x_k
     g00 = None     # gradient at x_{k-1}
     alpha0 = None
@@ -273,10 +339,11 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
                     u14 = np.dot(ptilde, p)
                     u15 = np.dot(p, y)
                     denom = lam*u14*(u15 + u12) + u13*u13
-                    if (not np.isfinite(denom)) or denom <= np.finfo(float).eps*(abs(lam*u14*(u15 + u12)) + u13*u13):
+                    if (not np.isfinite(denom)) or denom <= EPS*(abs(lam*u14*(u15 + u12)) + u13*u13):
                         status = 3
                         break
-                    dx = dx + lam*u14*u10*Hlam_y/denom - (u15 + u12)*u11*ptilde/denom + u13*u10*ptilde/denom + u13*u11*Hlam_y/denom
+                    dx = (dx + lam*u14*u10*Hlam_y/denom - (u15 + u12)*u11*ptilde/denom
+                          + u13*u10*ptilde/denom + u13*u11*Hlam_y/denom)
 
         # Check that the search direction is a descent direction
         dxTg = np.dot(dx, g)
@@ -311,9 +378,7 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
         dg_prev = dxTg
 
         # Line search
-        alpha, f_new, g_new, ls_status, ntry = line_search(fun, jac, xprev, f0, dx, dxTg, alpha, gtol)
-        nfev += ntry
-        njev += ntry
+        alpha, f_new, g_new, ls_status = line_search(fun, jac, xprev, f0, dx, dxTg, alpha, gtol)
 
         if ls_status != 0:
             if stage <= 1:
@@ -340,6 +405,8 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
 
     elapsedTime = time.perf_counter() - t_start
     fval = f
+    nfev = counts['f']
+    njev = counts['g']
 
     if status is None:
         status = 2
@@ -366,11 +433,7 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, 
 
     history = {
         'objective': objs,
-        'gradNorm': gradNorms,
-        'status': status,
-        'time': elapsedTime,
-        'iters': len(objs),
-        'invokedCubic': invokedCubic,
+        'grad_norm': gradNorms,
     }
 
     return optimize.OptimizeResult(
@@ -395,7 +458,8 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
 
     Finds alpha with sufficient decrease, f(x0 + alpha*dx) <= f0 + 1e-4*alpha*dg,
     and a flatter slope, |jac(x0 + alpha*dx)'dx| < 0.9*|dg|, using Davidon's
-    cubic interpolation. dg = jac(x0)'dx must be negative.
+    cubic interpolation. dg = jac(x0)'dx must be negative. When the decrease is
+    below rounding error in f, f within rounding error of f0 is accepted instead.
 
     Returns
     -------
@@ -403,15 +467,19 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
     f : the function value at the new point
     g : the gradient at the new point
     status : 0 = success, 4 = failed, 7 = the step is too small to change x
-    ntry : the number of trial points (each costs one fun and one jac evaluation)
     """
     fmin = f0
     ap, fp, dp = 0.0, f0, dg  # previous trial point: step, f, slope
-    eps_x = np.finfo(float).eps*np.abs(x0)
+    eps_x = EPS*np.abs(x0)
+    # Allowance for rounding error in f: near a minimizer, f can't resolve the decrease the
+    # first test asks for, so accept f up to this much above f0 if the slope test passes
+    # (the approximate Wolfe condition of Hager and Zhang). Rounding error in a sum of many
+    # terms can be hundreds of eps relative to f, so the margin is well above that
+    eps_f = 1e-10*abs(f0)
     ntry = 0
     while ntry < maxtry:
         if np.all(np.abs(alpha*dx) <= eps_x):
-            return alpha, f0, None, 7, ntry  # step no longer changes x in floating point
+            return alpha, f0, None, 7  # step no longer changes x in floating point
 
         x = x0 + alpha*dx
         f = fun(x)
@@ -428,9 +496,9 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
 
         # Accept: sufficient decrease and slope reduced (after at least two trials,
         # unless the slope is already essentially zero)
-        if f <= fmin + 1e-4*alpha*dg and abs(dalpha/dg) < 0.9:
+        if (f <= fmin + 1e-4*alpha*dg or f <= fmin + eps_f) and abs(dalpha/dg) < 0.9:
             if ntry >= 2 or abs(dalpha/dg) < gtol:
-                return alpha, f, g, 0, ntry
+                return alpha, f, g, 0
 
         # Davidon's formula for the minimum of the cubic through (ap, fp, dp) and (alpha, f, dalpha)
         u1 = dp + dalpha - 3.0*(fp - f)/(ap - alpha)
@@ -452,4 +520,4 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
         ap, fp, dp = alpha, f, dalpha
         alpha = at
 
-    return alpha, f0, None, 4, ntry  # out of trials: the last point may not decrease f
+    return alpha, f0, None, 4  # out of trials: the last point may not decrease f

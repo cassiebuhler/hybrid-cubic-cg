@@ -99,7 +99,8 @@ def test_result_fields():
         assert field in res
     assert res.fun == pytest.approx(rosen(res.x))
     np.testing.assert_allclose(res.jac, rosen_der(res.x))
-    assert len(res.history["objective"]) == len(res.history["gradNorm"])
+    assert set(res.history) == {"objective", "grad_norm"}
+    assert len(res.history["objective"]) == len(res.history["grad_norm"]) == res.nit
 
 
 def test_x0_not_modified():
@@ -126,9 +127,47 @@ def test_args_passed_to_fun_and_jac():
     np.testing.assert_allclose(res.x, 3.0*np.ones(5), atol=1e-6)
 
 
-def test_jac_must_be_callable():
-    with pytest.raises(ValueError):
-        minimize(rosen, np.zeros(5))
+def test_invalid_jac_rejected():
+    with pytest.raises(ValueError, match="finite differences"):
+        minimize(rosen, np.zeros(5), jac="cs")
+
+
+@pytest.mark.parametrize("jac", [None, "2-point", "3-point"])
+def test_finite_differences(jac):
+    res = minimize(rosen, np.zeros(10), jac=jac)
+    assert res.status in (0, 7)  # FD gradients may not reach gtol=1e-6 exactly
+    np.testing.assert_allclose(res.x, np.ones(10), atol=1e-4)
+
+
+def test_finite_differences_count_evaluations():
+    calls = []
+
+    def f(x):
+        calls.append(1)
+        return rosen(x)
+
+    res = minimize(f, np.zeros(5), jac="2-point", maxiter=20)
+    assert res.nfev == len(calls)
+    assert res.njev > 0
+
+
+def test_finite_difference_matches_analytic_on_quadratic():
+    f, g, x_star = ill_conditioned_quadratic(n=20)
+    res = minimize(f, np.zeros(20), jac="3-point", gtol=1e-5)
+    assert res.status == 0
+    np.testing.assert_allclose(res.x, x_star, atol=1e-5)
+
+
+def test_finite_diff_rel_step_option():
+    res = minimize(rosen, np.zeros(5), jac="2-point", finite_diff_rel_step=1e-6)
+    np.testing.assert_allclose(res.x, np.ones(5), atol=1e-3)
+
+
+@pytest.mark.parametrize("jac", [None, "2-point", "3-point"])
+def test_scipy_custom_method_finite_differences(jac):
+    from scipy.optimize import minimize as scipy_minimize
+    res = scipy_minimize(rosen, np.zeros(5), jac=jac, method=minimize)
+    np.testing.assert_allclose(res.x, np.ones(5), atol=1e-4)
 
 
 def test_scipy_custom_method():
@@ -144,6 +183,7 @@ def test_unknown_option_warns():
 
 def test_scipy_custom_method_no_warning():
     import warnings
+
     from scipy.optimize import minimize as scipy_minimize
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -220,6 +260,7 @@ def test_fun_returning_array_gives_float():
 
 def test_scipy_tol_sets_gtol():
     import warnings
+
     from scipy.optimize import minimize as scipy_minimize
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -292,3 +333,29 @@ def test_complex_x0_rejected():
 def test_x0_must_be_1d():
     with pytest.raises(ValueError):
         minimize(lambda x: np.sum(x**2), np.zeros((2, 2)), jac=lambda x: 2*x)
+
+
+def bdqrtic(x):
+    a = x[:-4]
+    q = a**2 + 2*x[1:-3]**2 + 3*x[2:-2]**2 + 4*x[3:-1]**2 + 5*x[-1]**2
+    return np.sum((-4*a + 3)**2 + q**2)
+
+
+def bdqrtic_grad(x):
+    a = x[:-4]
+    q = a**2 + 2*x[1:-3]**2 + 3*x[2:-2]**2 + 4*x[3:-1]**2 + 5*x[-1]**2
+    g = np.zeros_like(x)
+    g[:-4] += -8*(-4*a + 3) + 4*q*a
+    g[1:-3] += 8*q*x[1:-3]
+    g[2:-2] += 12*q*x[2:-2]
+    g[3:-1] += 16*q*x[3:-1]
+    g[-1] += 20*np.sum(q)*x[-1]
+    return g
+
+
+def test_large_minimum_value_converges():
+    # f* is about 4e3, so near the minimizer changes in f are at rounding level. The line
+    # search used to spin for hundreds of trials there and then fail with status 4
+    res = minimize(bdqrtic, np.ones(1000), jac=bdqrtic_grad)
+    assert res.status == 0
+    assert res.nfev < 10*res.nit

@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pycutest build cache (benchmarks)
+pycutest_cache_holder/
