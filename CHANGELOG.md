@@ -12,7 +12,8 @@ First release.
   (Buhler, Benson & Shanno, 2024), with an interface that follows
   `scipy.optimize.minimize` and can be passed to it as `method=minimize`.
 - Gradients from a callable, from `fun` itself (`jac=True`), or by finite
-  differences (`jac=None`, `'2-point'` or `'3-point'`).
+  differences: central by default (`jac=None` or `'3-point'`), or forward
+  (`'2-point'`).
 - Line search accepts a point whose value is within rounding error of the
   current one when the slope condition holds (approximate Wolfe condition), so
   problems with a large optimal value converge instead of failing near the

@@ -53,10 +53,11 @@ def minimize(
         Gradient of ``fun``, ``jac(x, *args) -> ndarray`` of shape (n,).
         If ``True``, ``fun`` returns the gradient along with the value, and
         it is called once per point. If ``None`` (the default) or
-        ``'2-point'``, the gradient is estimated by forward differences, which
-        costs ``n`` extra evaluations of ``fun`` per gradient; ``'3-point'``
-        uses central differences (``2n`` evaluations, more accurate). An
-        analytic gradient is much faster and more accurate for large ``n``.
+        ``'3-point'``, the gradient is estimated by central differences, which
+        costs ``2n`` evaluations of ``fun`` per gradient. ``'2-point'`` uses
+        forward differences (``n`` evaluations), but these are accurate only to
+        about ``sqrt(eps)`` relative, so use a looser ``gtol`` (e.g. ``1e-4``)
+        with them. An analytic gradient is much faster and more accurate.
     maxiter : int, optional
         Maximum number of iterations.
     gtol : float, optional
@@ -69,8 +70,8 @@ def minimize(
         (U in Algorithm 2). When reached, a restart is done instead.
     finite_diff_rel_step : float, optional
         Relative step size for finite differences; the step for ``x[i]`` is
-        ``finite_diff_rel_step * max(1, |x[i]|)``. Defaults to ``sqrt(eps)``
-        for ``'2-point'`` and ``eps**(1/3)`` for ``'3-point'``.
+        ``finite_diff_rel_step * max(1, |x[i]|)``. Defaults to ``eps**(1/3)``
+        for central differences and ``sqrt(eps)`` for ``'2-point'``.
     disp : bool, optional
         Print a summary when finished.
     callback : callable, optional
@@ -168,8 +169,9 @@ def minimize(
                 counts['g'] += 1
                 return np.array(_jac(x, *args), dtype=float)
         elif jac is None or jac is False or jac in ('2-point', '3-point'):
-            # Finite differences: n extra evaluations of fun per gradient (2n for '3-point')
-            central = jac == '3-point'
+            # Finite differences: central by default (2n evaluations of fun per gradient), since
+            # the line search needs accurate slopes; forward differences ('2-point') take n
+            central = jac != '2-point'
             if finite_diff_rel_step is None:
                 finite_diff_rel_step = EPS**(1/3) if central else EPS**0.5
 

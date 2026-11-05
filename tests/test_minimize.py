@@ -132,11 +132,18 @@ def test_invalid_jac_rejected():
         minimize(rosen, np.zeros(5), jac="cs")
 
 
-@pytest.mark.parametrize("jac", [None, "2-point", "3-point"])
-def test_finite_differences(jac):
+@pytest.mark.parametrize("jac", [None, "3-point"])
+def test_central_differences(jac):
     res = minimize(rosen, np.zeros(10), jac=jac)
-    assert res.status in (0, 7)  # FD gradients may not reach gtol=1e-6 exactly
-    np.testing.assert_allclose(res.x, np.ones(10), atol=1e-4)
+    assert res.status == 0
+    np.testing.assert_allclose(res.x, np.ones(10), atol=1e-5)
+
+
+def test_forward_differences():
+    # forward differences are accurate to about sqrt(eps), so they need a looser gtol
+    res = minimize(rosen, np.zeros(10), jac="2-point", gtol=1e-4)
+    assert res.status == 0
+    np.testing.assert_allclose(res.x, np.ones(10), atol=1e-3)
 
 
 def test_finite_differences_count_evaluations():
@@ -159,14 +166,17 @@ def test_finite_difference_matches_analytic_on_quadratic():
 
 
 def test_finite_diff_rel_step_option():
-    res = minimize(rosen, np.zeros(5), jac="2-point", finite_diff_rel_step=1e-6)
+    default = minimize(rosen, np.zeros(5), jac="3-point", gtol=1e-4)
+    res = minimize(rosen, np.zeros(5), jac="3-point", gtol=1e-4, finite_diff_rel_step=1e-4)
+    assert res.status == 0
     np.testing.assert_allclose(res.x, np.ones(5), atol=1e-3)
+    assert not np.array_equal(res.x, default.x)  # the option changed the gradient estimates
 
 
 @pytest.mark.parametrize("jac", [None, "2-point", "3-point"])
 def test_scipy_custom_method_finite_differences(jac):
     from scipy.optimize import minimize as scipy_minimize
-    res = scipy_minimize(rosen, np.zeros(5), jac=jac, method=minimize)
+    res = scipy_minimize(rosen, np.zeros(5), jac=jac, method=minimize, tol=1e-4)
     np.testing.assert_allclose(res.x, np.ones(5), atol=1e-4)
 
 
