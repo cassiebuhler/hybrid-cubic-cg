@@ -2,6 +2,7 @@
 
 [![Tests](https://github.com/cassiebuhler/hybrid-cubic-cg/actions/workflows/tests.yml/badge.svg)](https://github.com/cassiebuhler/hybrid-cubic-cg/actions/workflows/tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/hybrid-cubic-cg)](https://pypi.org/project/hybrid-cubic-cg/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23990317.svg)](https://doi.org/10.5281/zenodo.23990317)
 
 A Python implementation of the **Hybrid Cubic Regularization of Conjugate Gradient Minimization Methods (CGM)** for smooth unconstrained optimization.
 
@@ -53,6 +54,8 @@ res = scipy_minimize(f, x0=np.zeros(100), jac=grad, method=minimize, options={"g
 Comparisons with SciPy's `CG` and `L-BFGS-B` on standard and CUTEst test problems are in [benchmarks/](https://github.com/cassiebuhler/hybrid-cubic-cg/tree/main/benchmarks).
 
 ## Citation
+
+Please cite the paper. The software is archived on Zenodo at [10.5281/zenodo.23990317](https://doi.org/10.5281/zenodo.23990317).
 
 ```bibtex
 @article{buhler2024regularized,

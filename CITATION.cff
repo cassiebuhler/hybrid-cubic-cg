@@ -15,6 +15,10 @@ authors:
   - family-names: Shanno
     given-names: David F.
 license: BSD-3-Clause
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.23990317"
+    description: "Zenodo archive (all versions)"
 repository-code: "https://github.com/cassiebuhler/hybrid-cubic-cg"
 keywords:
   - optimization
