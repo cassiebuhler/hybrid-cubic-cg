@@ -40,7 +40,20 @@ from hybrid_cubic_cg import minimize
 res = scipy_minimize(f, x0=np.zeros(100), jac=grad, method=minimize)
 ```
 
-Solver options such as `maxiter`, `gtol` and `pertlim` go in `options`, e.g. `options={"gtol": 1e-8}`.
+Solver options such as `maxiter`, `gtol` and `pertlim` go in `options`, e.g. `options={"gtol": 1e-8}`. SciPy's `tol` argument also works and sets `gtol`.
+
+If computing the value and gradient together is cheaper, have `fun` return both and pass `jac=True`:
+
+```python
+def f_and_grad(x):
+    r = x[1:] - x[:-1]**2
+    g = np.zeros_like(x)
+    g[:-1] = -400 * x[:-1] * r - 2 * (1 - x[:-1])
+    g[1:] += 200 * r
+    return np.sum(100 * r**2 + (1 - x[:-1])**2), g
+
+res = minimize(f_and_grad, x0=np.zeros(100), jac=True)
+```
 
 ## Citation
 

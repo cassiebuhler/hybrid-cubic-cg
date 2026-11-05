@@ -13,7 +13,7 @@ import numpy as np
 from scipy import optimize
 
 
-def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
+def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=None, tol=None, pertlim=5,
              disp=False, callback=None, bounds=None, constraints=(), **unused):
     """
     Minimize a smooth function with hybrid cubic regularized conjugate gradient.
@@ -21,17 +21,23 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
     Parameters
     ----------
     fun : callable
-        Objective function, ``fun(x, *args) -> float``.
+        Objective function, ``fun(x, *args) -> float``. If ``jac=True``,
+        ``fun`` returns both the value and the gradient: ``(f, g)``.
     x0 : array_like, shape (n,)
         Initial guess.
     args : tuple, optional
         Extra arguments passed to ``fun`` and ``jac``.
-    jac : callable
+    jac : callable or True
         Gradient of ``fun``, ``jac(x, *args) -> ndarray`` of shape (n,).
+        If ``True``, ``fun`` returns the gradient along with the value, and
+        it is called once per point.
     maxiter : int, optional
         Maximum number of iterations.
     gtol : float, optional
-        Converged when ``||jac(x)|| <= gtol``.
+        Converged when ``||jac(x)|| <= gtol``. Default ``1e-6``.
+    tol : float, optional
+        Same as ``gtol``; this is the name ``scipy.optimize.minimize`` uses.
+        If both are given, ``gtol`` is used.
     pertlim : int, optional
         Maximum number of lambda values tried for cubic regularization
         (U in Algorithm 2). When reached, a restart is done instead.
@@ -55,7 +61,9 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
         Status codes: 0 = solved, 1 = search direction is not a descent
         direction, 2 = iterations limit reached, 3 = search direction is
         undefined, 4 = line search failed, 5 = function or gradient is not
-        finite, 6 = stopped by callback.
+        finite, 6 = stopped by callback, 7 = precision limit reached (the
+        step is too small to change x in floating point, usually because x
+        is already very close to a minimizer; check ``res.jac``).
     """
     # initialize
     t_start = time.perf_counter()
@@ -81,17 +89,41 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
             return True
         return False
 
+    # Convergence tolerance: gtol, else scipy's generic tol, else the default
+    if gtol is None:
+        gtol = tol if tol is not None else 1e-6
+
     # Wrap fun and jac so they receive the extra args. The gradient is copied in case
     # jac reuses its output array, since we keep gradients from previous iterations
-    if not callable(jac):
-        raise ValueError('jac must be a callable that returns the gradient.')
-    _fun, _jac = fun, jac
+    if jac is True:
+        # fun returns (f, g): evaluate it once per point and keep both results
+        _fun_and_jac = fun
+        last = {'x': None}
 
-    def fun(x):
-        return np.asarray(_fun(x, *args), dtype=float).item()
+        def evaluate(x):
+            if last['x'] is None or not np.array_equal(last['x'], x):
+                f_val, g_val = _fun_and_jac(x, *args)
+                last['f'] = np.asarray(f_val, dtype=float).item()
+                last['g'] = np.array(g_val, dtype=float)
+                last['x'] = np.copy(x)
+            return last
 
-    def jac(x):
-        return np.array(_jac(x, *args), dtype=float)
+        def fun(x):
+            return evaluate(x)['f']
+
+        def jac(x):
+            return np.copy(evaluate(x)['g'])
+    elif callable(jac):
+        _fun, _jac = fun, jac
+
+        def fun(x):
+            return np.asarray(_fun(x, *args), dtype=float).item()
+
+        def jac(x):
+            return np.array(_jac(x, *args), dtype=float)
+    else:
+        raise ValueError('jac must be a callable that returns the gradient, or True '
+                         'if fun returns (value, gradient).')
 
     # Counters and outputs
     k = 0
@@ -104,6 +136,8 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
     newPoint = False  # x is a new point that hasn't been passed to the callback yet
 
     # Current point and gradient (g is the gradient)
+    if np.iscomplexobj(x0):
+        raise ValueError('x0 must be real; complex values are not supported.')
     x = np.atleast_1d(np.asarray(x0, dtype=float)).copy()
     if x.ndim != 1:
         raise ValueError('x0 must be one-dimensional.')
@@ -277,13 +311,13 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
         dg_prev = dxTg
 
         # Line search
-        alpha, f_new, g_new, ok, ntry = line_search(fun, jac, xprev, f0, dx, dxTg, alpha, gtol)
+        alpha, f_new, g_new, ls_status, ntry = line_search(fun, jac, xprev, f0, dx, dxTg, alpha, gtol)
         nfev += ntry
         njev += ntry
 
-        if not ok:
+        if ls_status != 0:
             if stage <= 1:
-                status = 4  # failed even along steepest descent
+                status = ls_status  # failed even along steepest descent: 4 or 7
                 break
             # restart with steepest descent from the current point
             nrst = n
@@ -318,6 +352,8 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
         4: 'Line search failed.',
         5: 'Function or gradient is not finite.',
         6: 'Stopped by callback.',
+        7: ('Precision limit reached: the step is too small to change x. '
+            'Gradient norm is %.1e; x may already be close enough to optimal.' % np.linalg.norm(g)),
     }
 
     if disp:
@@ -366,16 +402,16 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
     alpha : the step length
     f : the function value at the new point
     g : the gradient at the new point
-    ok : whether the search succeeded
+    status : 0 = success, 4 = failed, 7 = the step is too small to change x
     ntry : the number of trial points (each costs one fun and one jac evaluation)
     """
     fmin = f0
     ap, fp, dp = 0.0, f0, dg  # previous trial point: step, f, slope
-    dxTdx = np.dot(dx, dx)
+    eps_x = np.finfo(float).eps*np.abs(x0)
     ntry = 0
     while ntry < maxtry:
-        if alpha*dxTdx < 1e-20:
-            return alpha, f0, None, False, ntry  # step has shrunk to nothing
+        if np.all(np.abs(alpha*dx) <= eps_x):
+            return alpha, f0, None, 7, ntry  # step no longer changes x in floating point
 
         x = x0 + alpha*dx
         f = fun(x)
@@ -394,24 +430,26 @@ def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
         # unless the slope is already essentially zero)
         if f <= fmin + 1e-4*alpha*dg and abs(dalpha/dg) < 0.9:
             if ntry >= 2 or abs(dalpha/dg) < gtol:
-                return alpha, f, g, True, ntry
+                return alpha, f, g, 0, ntry
 
         # Davidon's formula for the minimum of the cubic through (ap, fp, dp) and (alpha, f, dalpha)
         u1 = dp + dalpha - 3.0*(fp - f)/(ap - alpha)
         u2 = np.sqrt(max(u1*u1 - dp*dalpha, 0.0))
-        at = alpha - (alpha - ap)*(dalpha + u2 - u1)/(dalpha - dp + 2.0*u2)
+        denom = dalpha - dp + 2.0*u2
+        at = alpha - (alpha - ap)*(dalpha + u2 - u1)/denom if denom != 0 else np.nan
+        bad = not np.isfinite(at)  # the cubic has no usable minimum: use the fallbacks below
 
-        if dalpha/dp > 0:
+        if dalpha*dp > 0:
             # minimum not bracketed yet: extrapolate (double) or step back (halve)
-            if dalpha <= 0 or at <= 0 or at >= 0.99*min(alpha, ap):
-                if dalpha > 0 or at <= 1.01*max(ap, alpha):
+            if bad or dalpha <= 0 or at <= 0 or at >= 0.99*min(alpha, ap):
+                if bad or dalpha > 0 or at <= 1.01*max(ap, alpha):
                     at = 2*max(ap, alpha) if dalpha <= 0 else min(ap, alpha)/2
         else:
             # minimum bracketed: bisect if the cubic's guess is too close to an end
-            if at < 1.01*min(alpha, ap) or at > 0.99*max(alpha, ap):
+            if bad or at < 1.01*min(alpha, ap) or at > 0.99*max(alpha, ap):
                 at = (alpha + ap)/2
 
         ap, fp, dp = alpha, f, dalpha
         alpha = at
 
-    return alpha, f0, None, False, ntry  # out of trials: the last point may not decrease f
+    return alpha, f0, None, 4, ntry  # out of trials: the last point may not decrease f

@@ -218,6 +218,77 @@ def test_fun_returning_array_gives_float():
     assert isinstance(res.fun, float)
 
 
+def test_scipy_tol_sets_gtol():
+    import warnings
+    from scipy.optimize import minimize as scipy_minimize
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        loose = scipy_minimize(rosen, np.zeros(5), jac=rosen_der, method=minimize, tol=1e-2)
+        tight = scipy_minimize(rosen, np.zeros(5), jac=rosen_der, method=minimize, tol=1e-8)
+    assert loose.status == 0 and tight.status == 0
+    assert np.linalg.norm(loose.jac) <= 1e-2
+    assert np.linalg.norm(tight.jac) <= 1e-8
+    assert loose.nit < tight.nit
+
+
+def test_gtol_takes_precedence_over_tol():
+    res = minimize(rosen, np.zeros(5), jac=rosen_der, gtol=1e-8, tol=1e-2)
+    assert np.linalg.norm(res.jac) <= 1e-8
+
+
+def test_jac_true():
+    calls = []
+
+    def fun_and_grad(x):
+        calls.append(1)
+        return rosen(x), rosen_der(x)
+
+    res = minimize(fun_and_grad, np.zeros(10), jac=True)
+    ref = minimize(rosen, np.zeros(10), jac=rosen_der)
+    assert res.status == 0
+    np.testing.assert_array_equal(res.x, ref.x)
+    assert res.nit == ref.nit
+    assert len(calls) == res.nfev  # one call per point, not one for f and one for g
+
+
+def test_jac_true_with_args():
+    def fun_and_grad(x, a):
+        return np.sum((x - a)**2), 2*(x - a)
+
+    res = minimize(fun_and_grad, np.zeros(5), args=(3.0,), jac=True)
+    assert res.status == 0
+    np.testing.assert_allclose(res.x, 3.0*np.ones(5), atol=1e-6)
+
+
+@pytest.mark.parametrize("n, gtol", [(5, 1e-10), (100, 1e-12)])
+def test_tight_gtol_converges(n, gtol):
+    # tiny search directions near the optimum used to be rejected as "too small"
+    res = minimize(rosen, np.zeros(n), jac=rosen_der, gtol=gtol)
+    assert res.status == 0
+    assert np.linalg.norm(res.jac) <= gtol
+
+
+def test_precision_limit_status():
+    # gtol below what floating point can reach: report status 7, not a plain failure
+    res = minimize(rosen, np.zeros(5), jac=rosen_der, gtol=1e-20)
+    assert res.status == 7
+    assert not res.success
+    assert "Precision limit" in res.message
+    np.testing.assert_allclose(res.x, np.ones(5), atol=1e-10)
+
+
+def test_scaled_objective_hits_precision_limit_quickly():
+    res = minimize(lambda x: 1e8*rosen(x), np.zeros(10), jac=lambda x: 1e8*rosen_der(x))
+    assert res.status == 7
+    assert res.nit < 1000
+    np.testing.assert_allclose(res.x, np.ones(10), atol=1e-8)
+
+
+def test_complex_x0_rejected():
+    with pytest.raises(ValueError, match="real"):
+        minimize(lambda x: np.sum(x**2), np.ones(3) + 0j, jac=lambda x: 2*x)
+
+
 def test_x0_must_be_1d():
     with pytest.raises(ValueError):
         minimize(lambda x: np.sum(x**2), np.zeros((2, 2)), jac=lambda x: 2*x)
