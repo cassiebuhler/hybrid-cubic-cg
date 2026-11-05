@@ -267,7 +267,7 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
                 nrst += 1
                 stage = 2
 
-        # Initial step length guess (as in Conmin-CG)
+        # Initial step length guess
         if stage <= 1:
             alpha = 1.0/np.sqrt(gTg)
         elif nrst == 1:
@@ -276,7 +276,7 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
             alpha = alpha*dg_prev/dxTg
         dg_prev = dxTg
 
-        # Line search (Shanno's inexact line search from Conmin-CG)
+        # Line search
         alpha, f_new, g_new, ok, ntry = line_search(fun, jac, xprev, f0, dx, dxTg, alpha, gtol)
         nfev += ntry
         njev += ntry
@@ -355,7 +355,7 @@ def minimize(fun, x0, args=(), jac=None, *, maxiter=10000, gtol=1e-6, pertlim=5,
 
 def line_search(fun, jac, x0, f0, dx, dg, alpha, gtol, maxtry=300):
     """
-    Shanno's inexact line search, as implemented in Conmin-CG.
+    Inexact line search using Davidon's cubic interpolation.
 
     Finds alpha with sufficient decrease, f(x0 + alpha*dx) <= f0 + 1e-4*alpha*dg,
     and a flatter slope, |jac(x0 + alpha*dx)'dx| < 0.9*|dg|, using Davidon's
